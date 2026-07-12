@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IMPOSTER — Social Deduction Party Game</title>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            display: ['"Space Grotesk"', 'sans-serif'],
+            body: ['"Inter"', 'sans-serif']
+          },
+          colors: {
+            ink: '#09090b' // zinc-950 alias used for the anti-peek screen
+          },
+          keyframes: {
+            pop:    { '0%': { transform: 'scale(.92)', opacity: '0' }, '100%': { transform: 'scale(1)', opacity: '1' } },
+            rise:   { '0%': { transform: 'translateY(14px)', opacity: '0' }, '100%': { transform: 'translateY(0)', opacity: '1' } },
+            pulseRing: { '0%,100%': { opacity: '.35' }, '50%': { opacity: '1' } }
+          },
+          animation: {
+            pop: 'pop .25s ease-out both',
+            rise: 'rise .35s ease-out both',
+            pulseRing: 'pulseRing 1.6s ease-in-out infinite'
+          }
+        }
+      }
+    };
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+  <style>
+    ::selection { background: #6366f1; color: white; }
+    body { font-family: 'Inter', sans-serif; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { scrollbar-width: none; }
+    /* Timer ring transition */
+    .ring-progress { transition: stroke-dashoffset 1s linear, stroke .5s ease; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    }
+    button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+      outline: 2px solid #818cf8; outline-offset: 2px;
+    }
+  </style>
+</head>
+
+<body class="h-full bg-zinc-950 text-zinc-100 antialiased">
+  <!-- Ambient background glow -->
+  <div class="fixed inset-0 -z-10 pointer-events-none"
+       style="background:
+         radial-gradient(700px 380px at 15% -5%, rgba(99,102,241,.16), transparent 60%),
+         radial-gradient(600px 340px at 90% 110%, rgba(139,92,246,.13), transparent 60%);">
+  </div>
+
+  <!-- Main app mount -->
+  <main id="app" class="min-h-full max-w-3xl mx-auto px-4 py-6 sm:py-10"></main>
+
+  <!-- Pure-black anti-peek overlay for Local Pass & Play transitions -->
+  <div id="blackout" class="fixed inset-0 z-50 bg-black hidden flex-col items-center justify-center text-center px-6"></div>
+
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] hidden px-4 py-2.5 rounded-xl
+       bg-zinc-800/95 border border-zinc-700 text-sm font-medium shadow-2xl"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/words.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
