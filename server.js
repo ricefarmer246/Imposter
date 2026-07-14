@@ -42,6 +42,11 @@ const VOTE_LOCK_MS = 4_000;       // grace window once everyone has voted
 const LAST_STAND_MS = 25_000;     // caught imposter's final guess window
 const EMPTY_ROOM_TTL_MS = 60_000; // delete a room this long after it empties
 
+const MAX_CUSTOM_CATEGORIES = 40;
+const MAX_WORDS_PER_CATEGORY = 80;
+const MAX_WORD_LEN = 40;
+const MAX_CATEGORY_NAME_LEN = 24;
+
 /** @type {Map<string, Room>} */
 const rooms = new Map();
 
@@ -69,6 +74,34 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+function shuffled(arr) {
+  return [...arr].sort(() => Math.random() - 0.5);
+}
+
+/** Clamps a host-supplied word bank to sane sizes; returns null if unusable. */
+function sanitizeWordBank(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const bank = {};
+  for (const catName of Object.keys(raw).slice(0, MAX_CUSTOM_CATEGORIES)) {
+    const cleanName = String(catName).trim().slice(0, MAX_CATEGORY_NAME_LEN);
+    const words = raw[catName];
+    if (!cleanName || !Array.isArray(words)) continue;
+    const cleanWords = [...new Set(
+      words.map((w) => String(w).trim().slice(0, MAX_WORD_LEN)).filter(Boolean)
+    )].slice(0, MAX_WORDS_PER_CATEGORY);
+    if (cleanWords.length > 0) bank[cleanName] = cleanWords;
+  }
+  return Object.keys(bank).length > 0 ? bank : null;
+}
+
+/** Restricts the category pool to the host's selection (falls back to "all"). */
+function sanitizeCategories(raw, bank) {
+  if (!Array.isArray(raw)) return null;
+  const valid = new Set(Object.keys(bank));
+  const picked = raw.filter((c) => valid.has(c));
+  return picked.length > 0 ? picked : null;
+}
+
 function createRoom(hostSocket, hostName) {
   const code = generateRoomCode();
   const room = {
@@ -79,7 +112,10 @@ function createRoom(hostSocket, hostName) {
     players: new Map(), // socketId -> player
     category: null,
     word: null,
-    imposterId: null,
+    imposterIds: new Set(),
+    imposterCount: 1,
+    impostersKnowEachOther: true,
+    lastStandAccusedId: null,
     discussionSeconds: 240,
     discussionStartAt: null,
     discussionEndsAt: null,
@@ -171,24 +207,36 @@ function broadcastVotes(room) {
 /* Phase transitions                                                   */
 /* ------------------------------------------------------------------ */
 
-function startGame(room, requestedSeconds) {
+function startGame(room, opts = {}) {
   const active = connectedPlayers(room);
   if (active.length < MIN_PLAYERS) return { error: `Need at least ${MIN_PLAYERS} connected players.` };
 
   clearAllTimers(room);
   room.round += 1;
-  room.discussionSeconds = VALID_DISCUSSION_SECONDS.includes(requestedSeconds)
-    ? requestedSeconds
+  room.discussionSeconds = VALID_DISCUSSION_SECONDS.includes(Number(opts.discussionSeconds))
+    ? Number(opts.discussionSeconds)
     : 240;
 
-  // Pick category, word, and imposter.
-  const category = pickRandom(Object.keys(WORDS));
-  const word = pickRandom(WORDS[category]);
-  const imposter = pickRandom(active);
+  const bank = sanitizeWordBank(opts.wordBank) || WORDS;
+  const categoryPool = sanitizeCategories(opts.categories, bank) || Object.keys(bank);
+  room.impostersKnowEachOther = opts.impostersKnowEachOther !== false;
+
+  const maxImposters = Math.max(1, Math.floor((active.length - 1) / 2));
+  const requestedCount = Number(opts.imposterCount);
+  room.imposterCount = Number.isInteger(requestedCount) && requestedCount >= 1
+    ? Math.min(requestedCount, maxImposters)
+    : 1;
+
+  // Pick category, word, and imposters.
+  const category = pickRandom(categoryPool);
+  const word = pickRandom(bank[category]);
+  const imposters = shuffled(active).slice(0, room.imposterCount);
+  const imposterIds = new Set(imposters.map((p) => p.id));
 
   room.category = category;
   room.word = word;
-  room.imposterId = imposter.id;
+  room.imposterIds = imposterIds;
+  room.lastStandAccusedId = null;
   room.phase = "reveal";
   room.discussionStartAt = null;
   room.discussionEndsAt = null;
@@ -197,7 +245,7 @@ function startGame(room, requestedSeconds) {
   for (const p of room.players.values()) {
     p.ready = false;
     p.vote = null;
-    p.isImposter = p.id === imposter.id;
+    p.isImposter = imposterIds.has(p.id);
   }
 
   // Private role delivery — pushed straight to each player's personal view.
@@ -206,7 +254,10 @@ function startGame(room, requestedSeconds) {
       round: room.round,
       category,
       isImposter: p.isImposter,
-      word: p.isImposter ? null : word
+      word: p.isImposter ? null : word,
+      teammates: p.isImposter && room.impostersKnowEachOther
+        ? imposters.filter((im) => im.id !== p.id).map((im) => im.name)
+        : []
     });
   }
 
@@ -269,9 +320,9 @@ function tallyVotes(room) {
   const isTie = entries.length > 1 && entries[1][1] === topVotes;
   const accusedId = !isTie && topVotes > 0 ? topId : null;
 
-  if (accusedId === room.imposterId) {
+  if (accusedId && room.imposterIds.has(accusedId)) {
     // Caught — but the imposter gets one dramatic final guess.
-    startLastStand(room);
+    startLastStand(room, accusedId);
   } else {
     endGame(room, {
       outcome: "imposter",
@@ -282,13 +333,14 @@ function tallyVotes(room) {
   }
 }
 
-function startLastStand(room) {
+function startLastStand(room, accusedId) {
   room.phase = "lastStand";
+  room.lastStandAccusedId = accusedId;
   const endsAt = Date.now() + LAST_STAND_MS;
   io.to(room.code).emit("lastStand:start", {
     endsAt,
-    accusedId: room.imposterId,
-    accusedName: room.players.get(room.imposterId)?.name || "The Imposter",
+    accusedId,
+    accusedName: room.players.get(accusedId)?.name || "The Imposter",
     category: room.category
   });
   room.timers.phase = setTimeout(() => {
@@ -305,13 +357,14 @@ function endGame(room, { outcome, reason }) {
   room.phase = "results";
 
   const counts = voteCounts(room);
+  const imposterIds = [...room.imposterIds];
   io.to(room.code).emit("game:over", {
     outcome, // 'citizens' | 'imposter'
     reason,
     category: room.category,
     word: room.word,
-    imposterId: room.imposterId,
-    imposterName: room.players.get(room.imposterId)?.name || "Unknown",
+    imposterIds,
+    imposterNames: imposterIds.map((id) => room.players.get(id)?.name || "Unknown"),
     votes: [...room.players.values()].map((p) => ({
       id: p.id,
       name: p.name,
@@ -332,7 +385,8 @@ function resetToLobby(room) {
   room.phase = "lobby";
   room.category = null;
   room.word = null;
-  room.imposterId = null;
+  room.imposterIds = new Set();
+  room.lastStandAccusedId = null;
   room.discussionStartAt = null;
   room.discussionEndsAt = null;
   room.votingEndsAt = null;
@@ -382,12 +436,12 @@ io.on("connection", (socket) => {
 
   socket.on("room:leave", () => leaveRoom(socket));
 
-  socket.on("game:start", ({ discussionSeconds }, ack) => {
+  socket.on("game:start", (opts, ack) => {
     const room = getRoomOf(socket);
     if (!room) return ack({ error: "Room no longer exists." });
     if (socket.id !== room.hostId) return ack({ error: "Only the host can start the game." });
     if (room.phase !== "lobby") return ack({ error: "Game already started." });
-    const result = startGame(room, Number(discussionSeconds));
+    const result = startGame(room, opts || {});
     ack(result.error ? result : { ok: true });
   });
 
@@ -431,9 +485,12 @@ io.on("connection", (socket) => {
   socket.on("imposter:guess", ({ guess }, ack) => {
     const room = getRoomOf(socket);
     if (!room) return ack({ error: "Room no longer exists." });
-    if (socket.id !== room.imposterId) return ack({ error: "Only the Imposter can guess." });
+    if (!room.imposterIds.has(socket.id)) return ack({ error: "Only the Imposter can guess." });
     const livePhases = ["discussion", "voting", "lastStand"];
     if (!livePhases.includes(room.phase)) return ack({ error: "You can only guess during a live round." });
+    if (room.phase === "lastStand" && socket.id !== room.lastStandAccusedId) {
+      return ack({ error: "Only the caught Imposter can guess right now." });
+    }
 
     const correct = normalizeGuess(guess) === normalizeGuess(room.word);
     ack({ ok: true, correct });
@@ -496,8 +553,10 @@ function leaveRoom(socket) {
   }
 
   const midGame = ["reveal", "discussion", "voting", "lastStand"].includes(room.phase);
+  const imposterLeft = room.imposterIds.has(socket.id);
+  const imposterRemains = remaining.some((p) => room.imposterIds.has(p.id));
 
-  if (midGame && socket.id === room.imposterId) {
+  if (midGame && imposterLeft && !imposterRemains) {
     endGame(room, { outcome: "citizens", reason: "The Imposter disconnected and forfeited the round." });
     return;
   }

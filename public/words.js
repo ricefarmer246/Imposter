@@ -36,16 +36,24 @@
     ],
     "Sports & Games": [
       "Chess", "Bowling", "Surfing", "Marathon", "Poker", "Dodgeball",
-      "Figure Skating", "Rock Climbing", "Table Tennis", "Golf", "Karaoke", "Darts"
+      "Figure Skating", "Rock Climbing", "Table Tennis", "Golf", "Karaoke", "Darts",
+      "Basketball", "Soccer", "Tennis", "Baseball", "Volleyball", "Cricket",
+      "Rugby", "Badminton"
     ],
     "Household Objects": [
       "Toaster", "Umbrella", "Vacuum Cleaner", "Alarm Clock", "Scissors",
-      "Candle", "Blender", "Mirror", "Doormat", "Stapler", "Bathtub", "Remote Control"
+      "Candle", "Blender", "Mirror", "Doormat", "Stapler", "Bathtub", "Remote Control",
+      "Broom", "Pillow", "Lamp", "Curtains"
     ],
     "Famous Landmarks": [
       "Eiffel Tower", "Great Wall of China", "Statue of Liberty", "Pyramids of Giza",
       "Big Ben", "Golden Gate Bridge", "Colosseum", "Taj Mahal",
       "Stonehenge", "Niagara Falls", "Mount Rushmore", "Sydney Opera House"
+    ],
+    "Anime": [
+      "Naruto", "One Piece", "Attack on Titan", "Death Note", "My Hero Academia",
+      "Dragon Ball Z", "Demon Slayer", "Sailor Moon", "Pokemon", "Studio Ghibli",
+      "Cowboy Bebop", "Fullmetal Alchemist"
     ]
   };
 });

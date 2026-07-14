@@ -24,6 +24,43 @@ const esc = (s) =>
 
 const normalizeGuess = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+/* ---------- Word bank (custom categories/hint words, persisted locally) ---------- */
+
+const MAX_WORDS_PER_CATEGORY = 80;
+const MAX_WORD_LEN = 40;
+const MAX_CATEGORY_NAME_LEN = 24;
+const BASE_CATEGORY_NAMES = new Set(Object.keys(WORDS));
+
+function getWordBank() {
+  try {
+    const stored = JSON.parse(localStorage.getItem("imposter.wordBank") || "null");
+    if (stored && typeof stored === "object" && Object.keys(stored).length) return stored;
+  } catch { /* corrupted storage — fall through to defaults */ }
+  return JSON.parse(JSON.stringify(WORDS));
+}
+function saveWordBank(bank) {
+  try { localStorage.setItem("imposter.wordBank", JSON.stringify(bank)); } catch { /* storage full/blocked */ }
+}
+function addWordToBank(bank, category, word) {
+  const clean = String(word).trim().slice(0, MAX_WORD_LEN);
+  if (!clean || !bank[category]) return;
+  if (bank[category].length >= MAX_WORDS_PER_CATEGORY) return;
+  if (bank[category].some((w) => w.toLowerCase() === clean.toLowerCase())) return;
+  bank[category].push(clean);
+}
+function removeWordFromBank(bank, category, word) {
+  if (!bank[category]) return;
+  bank[category] = bank[category].filter((w) => w !== word);
+}
+function addCategoryToBank(bank, name) {
+  const clean = String(name).trim().slice(0, MAX_CATEGORY_NAME_LEN);
+  if (!clean || bank[clean]) return;
+  bank[clean] = [];
+}
+function deleteCategoryFromBank(bank, category) {
+  delete bank[category];
+}
 const fmtClock = (ms) => {
   const s = Math.max(0, Math.ceil(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -139,9 +176,13 @@ const S = { screen: "menu" };
 const L = {
   names: [],
   seconds: 240,
+  selectedCategories: null,  // Set<string> — null means "not yet initialized"
+  imposterCount: 1,
+  impostersKnowEachOther: true,
   category: null,
   word: null,
-  imposterIndex: -1,
+  imposterIndices: [],
+  caughtIndex: -1,
   revealIndex: 0,
   revealShown: false,
   discussionStartAt: 0,
@@ -151,7 +192,8 @@ const L = {
   voteIndex: 0,
   votes: [],           // votes[i] = index of accused player
   lastStandGuess: "",
-  result: null         // { outcome, reason, tally }
+  result: null,        // { outcome, reason, tally }
+  wbNewCategory: ""
 };
 
 /** Online game state. */
@@ -159,14 +201,17 @@ const O = {
   selfId: null,
   name: "",
   state: null,   // last public room snapshot from the server
-  role: null,    // { category, word, isImposter, round }
+  role: null,    // { category, word, isImposter, round, teammates }
   discussion: null, // { startAt, endsAt, turnSeconds, order }
   votes: { counts: {}, votedCount: 0, eligible: 0 },
   myVote: null,
   locking: false,
   lastStand: null, // { endsAt, accusedId, accusedName, category }
   result: null,
-  guessBusy: false
+  guessBusy: false,
+  hostCategories: null,      // Set<string> — null means "not yet initialized"
+  hostImposterCount: 1,
+  hostImpostersKnowEachOther: true
 };
 
 const SCREENS = {};
@@ -259,6 +304,73 @@ function saveNames() {
   try { localStorage.setItem("imposter.names", JSON.stringify(L.names)); } catch { /* storage full/blocked */ }
 }
 
+/* ---------- Category / imposter-count settings (shared by local + online host) ---------- */
+
+let wbReturnScreen = "menu";
+
+function ensureCategorySelection(current, bank) {
+  const valid = Object.keys(bank);
+  const filtered = current ? new Set([...current].filter((c) => bank[c])) : null;
+  return filtered && filtered.size > 0 ? filtered : new Set(valid);
+}
+
+function maxImposters(playerCount) {
+  return Math.max(1, Math.floor((playerCount - 1) / 2));
+}
+
+/** Renders (and normalizes in place) the category / imposter-count / know-each-other controls. */
+function categorySettingsBlock(playerCount) {
+  const online = S.screen.startsWith("online");
+  const bank = getWordBank();
+  const categories = Object.keys(bank);
+
+  const selected = online
+    ? (O.hostCategories = ensureCategorySelection(O.hostCategories, bank))
+    : (L.selectedCategories = ensureCategorySelection(L.selectedCategories, bank));
+
+  const maxImp = maxImposters(playerCount);
+  const imposterCount = Math.min((online ? O.hostImposterCount : L.imposterCount) || 1, maxImp);
+  if (online) O.hostImposterCount = imposterCount; else L.imposterCount = imposterCount;
+  const knowEachOther = online ? O.hostImpostersKnowEachOther : L.impostersKnowEachOther;
+
+  return `
+    <h3 class="text-sm font-semibold text-zinc-300 mb-2">Categories</h3>
+    <div class="flex flex-wrap gap-2 mb-2">
+      ${categories.map((c) => `
+        <button data-action="toggleCategory" data-arg="${esc(c)}"
+          class="px-3 py-1.5 rounded-full text-xs font-semibold border transition
+            ${selected.has(c)
+              ? "bg-indigo-500/20 border-indigo-500 text-indigo-300"
+              : "bg-zinc-800/60 border-zinc-700 text-zinc-500 hover:border-zinc-500"}">
+          ${esc(c)}
+        </button>`).join("")}
+    </div>
+    <button data-action="goWordBank" class="text-xs text-indigo-300 hover:text-indigo-200 underline mb-6">
+      Manage word bank (add/remove hint words) →
+    </button>
+
+    <h3 class="text-sm font-semibold text-zinc-300 mb-2">Number of Imposters</h3>
+    <div class="grid gap-2 mb-4" style="grid-template-columns:repeat(${maxImp},minmax(0,1fr));">
+      ${Array.from({ length: maxImp }, (_, i) => i + 1).map((n) => `
+        <button data-action="setImposterCount" data-arg="${n}"
+          class="py-3 rounded-xl font-display font-bold border transition
+            ${imposterCount === n
+              ? "bg-rose-500/20 border-rose-500 text-rose-300"
+              : "bg-zinc-800/60 border-zinc-700 text-zinc-400 hover:border-zinc-500"}">
+          ${n}
+        </button>`).join("")}
+    </div>
+
+    ${imposterCount > 1 ? `
+    <button data-action="toggleKnowEachOther"
+      class="w-full flex items-center justify-between px-4 py-3 rounded-xl border mb-6 transition
+        ${knowEachOther ? "bg-indigo-500/10 border-indigo-500/60" : "bg-zinc-800/60 border-zinc-700"}">
+      <span class="text-sm font-medium text-zinc-200">Imposters know each other</span>
+      <span class="text-xs font-bold ${knowEachOther ? "text-indigo-300" : "text-zinc-500"}">${knowEachOther ? "ON" : "OFF"}</span>
+    </button>` : `<div class="mb-6"></div>`}
+  `;
+}
+
 SCREENS.localSetup = () => `
   ${header("Local Pass & Play")}
   <div class="${CARD} animate-rise">
@@ -296,6 +408,8 @@ SCREENS.localSetup = () => `
         </button>`).join("")}
     </div>
 
+    ${categorySettingsBlock(L.names.length)}
+
     <button data-action="localStart" class="${BTN.primary}">Start Round →</button>
   </div>`;
 
@@ -305,13 +419,73 @@ function syncNameInputs() {
   });
 }
 
+/* ---------- Word bank editor (add/remove hint words, shared local + online) ---------- */
+
+SCREENS.wordBank = () => {
+  const bank = getWordBank();
+  const categories = Object.keys(bank);
+  return `
+  ${header("Word Bank")}
+  <div class="${CARD} animate-rise">
+    <h2 class="font-display text-2xl font-bold mb-1">Manage categories &amp; hint words</h2>
+    <p class="text-sm text-zinc-400 mb-6">Add your own words, remove ones you don't like, or start a whole new category. Saved on this device.</p>
+
+    <div class="grid gap-4 mb-6">
+      ${categories.map((cat, ci) => `
+        <div class="rounded-2xl border border-zinc-800 bg-zinc-800/30 p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="font-display font-bold text-indigo-300">${esc(cat)}</h3>
+            ${!BASE_CATEGORY_NAMES.has(cat) ? `
+              <button data-action="wordBankDeleteCategory" data-arg="${ci}"
+                class="text-xs text-rose-400 hover:text-rose-300">Delete category</button>` : ""}
+          </div>
+          <div class="flex flex-wrap gap-1.5 mb-3">
+            ${bank[cat].map((w, wi) => `
+              <span class="inline-flex items-center gap-1.5 pl-3 pr-1.5 py-1 rounded-full text-xs
+                bg-zinc-800/70 border border-zinc-700 text-zinc-300">
+                ${esc(w)}
+                <button data-action="wordBankRemoveWord" data-cat="${ci}" data-arg="${wi}"
+                  aria-label="Remove ${esc(w)}"
+                  class="w-4 h-4 rounded-full flex items-center justify-center text-zinc-500 hover:text-rose-400 hover:bg-rose-500/10">✕</button>
+              </span>`).join("") || `<p class="text-xs text-zinc-600">No words yet — add one below.</p>`}
+          </div>
+          <div class="flex gap-2">
+            <input id="wb-add-${ci}" maxlength="${MAX_WORD_LEN}" placeholder="Add a word…"
+              class="flex-1 bg-zinc-800/70 border border-zinc-700 rounded-lg px-3 py-2 text-sm
+                     placeholder-zinc-500 focus:border-indigo-500 focus:outline-none" />
+            <button data-action="wordBankAddWord" data-arg="${ci}"
+              class="px-4 rounded-lg text-sm font-semibold bg-indigo-500 hover:bg-indigo-400 transition text-white">Add</button>
+          </div>
+        </div>`).join("")}
+    </div>
+
+    <div class="flex gap-2 mb-6">
+      <input id="wb-new-category" maxlength="${MAX_CATEGORY_NAME_LEN}" placeholder="New category name…"
+        class="flex-1 bg-zinc-800/70 border border-zinc-700 rounded-xl px-4 py-2.5 text-sm
+               placeholder-zinc-500 focus:border-indigo-500 focus:outline-none" />
+      <button data-action="wordBankAddCategory" class="px-5 rounded-xl text-sm font-semibold
+        bg-zinc-800/80 hover:bg-zinc-700/80 border border-zinc-700 transition text-zinc-200">+ New Category</button>
+    </div>
+
+    <button data-action="wordBankBack" class="${BTN.primary}">Done</button>
+  </div>`;
+};
+
 /* ---------- 4b. Engine ---------- */
 
 function startLocalRound() {
-  const category = pickRandom(Object.keys(WORDS));
+  const bank = getWordBank();
+  L.selectedCategories = ensureCategorySelection(L.selectedCategories, bank);
+  const categoryPool = [...L.selectedCategories];
+  const category = pickRandom(categoryPool);
   L.category = category;
-  L.word = pickRandom(WORDS[category]);
-  L.imposterIndex = Math.floor(Math.random() * L.names.length);
+  L.word = pickRandom(bank[category]);
+
+  L.imposterCount = Math.min(L.imposterCount || 1, maxImposters(L.names.length));
+  const order = [...L.names.keys()].sort(() => Math.random() - 0.5);
+  L.imposterIndices = order.slice(0, L.imposterCount);
+  L.caughtIndex = -1;
+
   L.revealIndex = 0;
   L.revealShown = false;
   L.askOffset = 0;
@@ -333,7 +507,10 @@ function startLocalRound() {
 SCREENS.localReveal = () => {
   const i = L.revealIndex;
   const name = L.names[i];
-  const isImposter = i === L.imposterIndex;
+  const isImposter = L.imposterIndices.includes(i);
+  const teammates = isImposter && L.impostersKnowEachOther
+    ? L.imposterIndices.filter((idx) => idx !== i).map((idx) => L.names[idx])
+    : [];
   const next = L.names[i + 1] || null;
 
   const secretCard = !L.revealShown
@@ -349,6 +526,8 @@ SCREENS.localReveal = () => {
       <p class="text-xs uppercase tracking-[.3em] text-rose-300 mb-3">Category · ${esc(L.category)}</p>
       <h3 class="font-display text-4xl font-bold text-rose-400 mb-3">YOU ARE THE IMPOSTER</h3>
       <p class="text-rose-200/90 font-medium">Blend in! You don't know the word — fake it, and listen for clues.</p>
+      ${teammates.length ? `
+      <p class="text-rose-200/70 text-sm mt-3">Your fellow Imposter${teammates.length > 1 ? "s" : ""}: <span class="font-semibold">${esc(teammates.join(", "))}</span></p>` : ""}
     </div>
     <button data-action="localRevealHide" class="${BTN.success} py-6 text-lg">
       Secret Copied! ${next ? `Click to Hide &amp; Pass to ${esc(next)}` : "Click to Hide &amp; Start Discussion"}
@@ -492,8 +671,8 @@ function resolveLocalClaim(guess) {
   const correct = normalizeGuess(guess) === normalizeGuess(L.word);
   L.claimOpen = false;
   L.result = correct
-    ? { outcome: "imposter", reason: `${L.names[L.imposterIndex]} went all-in and nailed it — the word was "${L.word}"!`, tally: null }
-    : { outcome: "citizens", reason: `${L.names[L.imposterIndex]} struck with "${guess.trim().slice(0, 40)}" — and missed!`, tally: null };
+    ? { outcome: "imposter", reason: `The Imposter went all-in and nailed it — the word was "${L.word}"!`, tally: null }
+    : { outcome: "citizens", reason: `The Imposter struck with "${guess.trim().slice(0, 40)}" — and missed!`, tally: null };
   go("localResults");
 }
 
@@ -558,7 +737,7 @@ function tallyLocalVotes() {
   const tally = L.names.map((name, i) => ({
     name, index: i,
     votes: L.votes.filter((v) => v === i).length,
-    isImposter: i === L.imposterIndex
+    isImposter: L.imposterIndices.includes(i)
   })).sort((a, b) => b.votes - a.votes);
 
   const top = tally[0];
@@ -566,6 +745,7 @@ function tallyLocalVotes() {
   const caughtImposter = !isTie && top.votes > 0 && top.isImposter;
 
   if (caughtImposter) {
+    L.caughtIndex = top.index;
     go("localLastStand");
   } else {
     L.result = {
@@ -587,7 +767,7 @@ SCREENS.localLastStand = () => `
     <div class="text-center mb-6">
       <div class="text-5xl mb-3">⚖️</div>
       <h2 class="font-display text-3xl font-bold mb-2">
-        You caught <span class="text-rose-400">${esc(L.names[L.imposterIndex])}</span>!
+        You caught <span class="text-rose-400">${esc(L.names[L.caughtIndex])}</span>!
       </h2>
       <p class="text-zinc-400">
         One escape route remains: name the exact secret word
@@ -605,11 +785,11 @@ function resolveLocalLastStand(guess) {
   const tally = L.names.map((name, i) => ({
     name, index: i,
     votes: L.votes.filter((v) => v === i).length,
-    isImposter: i === L.imposterIndex
+    isImposter: L.imposterIndices.includes(i)
   })).sort((a, b) => b.votes - a.votes);
 
   L.result = correct
-    ? { outcome: "imposter", reason: `Caught red-handed — but ${L.names[L.imposterIndex]} guessed "${L.word}" and stole the win!`, tally }
+    ? { outcome: "imposter", reason: `Caught red-handed — but ${L.names[L.caughtIndex]} guessed "${L.word}" and stole the win!`, tally }
     : { outcome: "citizens", reason: `The Imposter guessed "${guess.trim().slice(0, 40)}" — wrong! Justice served.`, tally };
   go("localResults");
 }
@@ -630,8 +810,12 @@ SCREENS.localResults = () => {
 
     <div class="grid grid-cols-2 gap-3 mb-6 text-center">
       <div class="rounded-2xl bg-zinc-800/60 border border-zinc-700 p-4">
-        <p class="text-xs uppercase tracking-widest text-zinc-500 mb-1">The Imposter</p>
-        <p class="font-display text-xl font-bold text-rose-400">${esc(L.names[L.imposterIndex])}</p>
+        <p class="text-xs uppercase tracking-widest text-zinc-500 mb-1">
+          The Imposter${L.imposterIndices.length > 1 ? "s" : ""}
+        </p>
+        <p class="font-display text-xl font-bold text-rose-400">
+          ${esc(L.imposterIndices.map((i) => L.names[i]).join(", "))}
+        </p>
       </div>
       <div class="rounded-2xl bg-zinc-800/60 border border-zinc-700 p-4">
         <p class="text-xs uppercase tracking-widest text-zinc-500 mb-1">The Word</p>
@@ -838,6 +1022,9 @@ SCREENS.onlineLobby = () => {
             ${s / 60} min
           </button>`).join("")}
       </div>
+
+      ${categorySettingsBlock(st.players.filter((p) => p.connected).length)}
+
       <button data-action="onlineStartGame" class="${canStart ? BTN.primary : BTN.ghost}"
         ${canStart ? "" : "disabled"}>
         ${canStart ? "Start Game →" : "Waiting for at least 3 players…"}
@@ -864,6 +1051,8 @@ SCREENS.onlineReveal = () => {
       <p class="text-xs uppercase tracking-[.3em] text-rose-300 mb-3">Category · ${esc(role.category)}</p>
       <h3 class="font-display text-4xl font-bold text-rose-400 mb-3">YOU ARE THE IMPOSTER</h3>
       <p class="text-rose-200/90 font-medium">Blend in! Answer questions like you know the word. You can steal the win anytime by guessing it exactly.</p>
+      ${role.teammates?.length ? `
+      <p class="text-rose-200/70 text-sm mt-3">Your fellow Imposter${role.teammates.length > 1 ? "s" : ""}: <span class="font-semibold">${esc(role.teammates.join(", "))}</span></p>` : ""}
     </div>`
     : `
     <div class="rounded-2xl border border-indigo-500/60 bg-indigo-500/10 py-10 px-6 text-center mb-6 animate-pop">
@@ -1093,8 +1282,10 @@ SCREENS.onlineResults = () => {
 
     <div class="grid grid-cols-2 gap-3 mb-6 text-center">
       <div class="rounded-2xl bg-zinc-800/60 border border-zinc-700 p-4">
-        <p class="text-xs uppercase tracking-widest text-zinc-500 mb-1">The Imposter</p>
-        <p class="font-display text-xl font-bold text-rose-400">${esc(r.imposterName)}</p>
+        <p class="text-xs uppercase tracking-widest text-zinc-500 mb-1">
+          The Imposter${r.imposterNames?.length > 1 ? "s" : ""}
+        </p>
+        <p class="font-display text-xl font-bold text-rose-400">${esc((r.imposterNames || []).join(", "))}</p>
       </div>
       <div class="rounded-2xl bg-zinc-800/60 border border-zinc-700 p-4">
         <p class="text-xs uppercase tracking-widest text-zinc-500 mb-1">The Word</p>
@@ -1146,11 +1337,13 @@ const ACTIONS = {
   localAddPlayer() {
     syncNameInputs();
     if (L.names.length < 10) L.names.push("");
+    L.imposterCount = Math.min(L.imposterCount, maxImposters(L.names.length));
     render();
   },
   localRemovePlayer({ arg }) {
     syncNameInputs();
     if (L.names.length > 3) L.names.splice(Number(arg), 1);
+    L.imposterCount = Math.min(L.imposterCount, maxImposters(L.names.length));
     render();
   },
   localSetSeconds({ arg }) {
@@ -1185,6 +1378,78 @@ const ACTIONS = {
     resolveLocalLastStand(guess);
   },
   localPlayAgain() { startLocalRound(); },
+
+  /* --- shared: categories / imposter count / word bank --- */
+  toggleCategory({ arg }) {
+    syncNameInputs();
+    const online = S.screen.startsWith("online");
+    const bank = getWordBank();
+    const set = online
+      ? (O.hostCategories = ensureCategorySelection(O.hostCategories, bank))
+      : (L.selectedCategories = ensureCategorySelection(L.selectedCategories, bank));
+    if (set.has(arg)) {
+      if (set.size > 1) set.delete(arg);
+    } else {
+      set.add(arg);
+    }
+    render();
+  },
+  setImposterCount({ arg }) {
+    syncNameInputs();
+    if (S.screen.startsWith("online")) O.hostImposterCount = Number(arg);
+    else L.imposterCount = Number(arg);
+    render();
+  },
+  toggleKnowEachOther() {
+    syncNameInputs();
+    if (S.screen.startsWith("online")) O.hostImpostersKnowEachOther = !O.hostImpostersKnowEachOther;
+    else L.impostersKnowEachOther = !L.impostersKnowEachOther;
+    render();
+  },
+  goWordBank() {
+    syncNameInputs();
+    wbReturnScreen = S.screen;
+    go("wordBank");
+  },
+  wordBankAddWord({ arg }) {
+    const ci = Number(arg);
+    const bank = getWordBank();
+    const cat = Object.keys(bank)[ci];
+    const input = document.getElementById(`wb-add-${ci}`);
+    const word = input?.value || "";
+    if (!word.trim()) return toast("Type a word first.", "error");
+    addWordToBank(bank, cat, word);
+    saveWordBank(bank);
+    render();
+  },
+  wordBankRemoveWord({ cat, arg }) {
+    const bank = getWordBank();
+    const catName = Object.keys(bank)[Number(cat)];
+    const word = bank[catName]?.[Number(arg)];
+    if (word === undefined) return;
+    removeWordFromBank(bank, catName, word);
+    saveWordBank(bank);
+    render();
+  },
+  wordBankAddCategory() {
+    const input = document.getElementById("wb-new-category");
+    const name = (input?.value || "").trim();
+    if (!name) return toast("Type a category name first.", "error");
+    const bank = getWordBank();
+    if (bank[name.slice(0, MAX_CATEGORY_NAME_LEN)]) return toast("That category already exists.", "error");
+    addCategoryToBank(bank, name);
+    saveWordBank(bank);
+    render();
+  },
+  wordBankDeleteCategory({ arg }) {
+    const bank = getWordBank();
+    const catName = Object.keys(bank)[Number(arg)];
+    if (!catName || BASE_CATEGORY_NAMES.has(catName)) return;
+    deleteCategoryFromBank(bank, catName);
+    saveWordBank(bank);
+    render();
+  },
+  wordBankBack() { go(wbReturnScreen); },
 
   /* --- online mode --- */
   goOnlineEntry() {
@@ -1223,7 +1488,13 @@ const ACTIONS = {
   },
   onlineSetSeconds({ arg }) { O.hostSeconds = Number(arg); render(); },
   onlineStartGame() {
-    socket.emit("game:start", { discussionSeconds: O.hostSeconds || 240 }, (res) => {
+    socket.emit("game:start", {
+      discussionSeconds: O.hostSeconds || 240,
+      categories: O.hostCategories ? [...O.hostCategories] : null,
+      imposterCount: O.hostImposterCount || 1,
+      impostersKnowEachOther: O.hostImpostersKnowEachOther !== false,
+      wordBank: getWordBank()
+    }, (res) => {
       if (res.error) toast(res.error, "error");
     });
   },

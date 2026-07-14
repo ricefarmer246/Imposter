@@ -135,7 +135,7 @@ function assert(cond, label) {
   imposterSocket.trigger("imposter:guess", { guess: "definitely-wrong-word" }, () => {});
   let over = lastEvent("game:over");
   assert(over.data.outcome === "citizens", "wrong last-stand guess => citizens win");
-  assert(over.data.word === secretWord && over.data.imposterId === imposterId,
+  assert(over.data.word === secretWord && over.data.imposterIds.includes(imposterId),
     "results reveal the word and the imposter");
 
   // 7. Play again -> round 2 -> imposter steals via correct mid-round guess
